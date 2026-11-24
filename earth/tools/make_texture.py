@@ -4,12 +4,17 @@
 
   正距円筒図法 (横:縦 = 2:1) の画像を、ファームに埋め込む生データへ変換する。
 
-  python3 tools/make_texture.py --day   assets/earth_day.jpg  \
-                                --night assets/earth_night.jpg
+  python3 tools/make_texture.py --day    assets/earth_day.jpg  \
+                                --night  assets/earth_night.jpg \
+                                --clouds assets/earth_clouds_composite.jpg
 
   出力:
     data/earth_day.rgb565   1024x512  RGB565 little-endian   (1 MB)
     data/earth_night.gray8  1024x512  8bit 輝度 (都市の灯り)  (512 KB)
+    data/earth_cloud.gray8  1024x512  8bit 雲の濃さ          (512 KB)
+
+  雲は、雲入りの合成画像 (Blue Marble "Land_ocean_ice_cloud") と雲なしの昼の画像
+  (Blue Marble "Land_shallow_topo") の差から取り出す。どちらも同じ投影・同じ位置合わせ。
 
   画像が無い場合は --placeholder で手続き生成の仮テクスチャを作る。
 """
@@ -23,6 +28,13 @@ import sys
 import tempfile
 
 W, H = 1024, 512
+LAND_GAMMA = 0.65        # 陸地の暗い色を持ち上げる強さ (1 = そのまま、小さいほど明るい)
+SEA_GAMMA = 0.90         # 海の補正 (弱め)
+LAND_KNEE = 0.50         # これより明るい陸地の色は圧縮する
+LAND_HIGHLIGHT = 0.45    # 圧縮の強さ (1 = そのまま、小さいほど砂漠が暗く)
+CLOUD_THRESHOLD = 0.30   # これより薄い差は雲とみなさない (大陸が見えるよう薄い雲は捨てる)
+CLOUD_OPACITY = 0.80     # 最も濃い雲の不透明度
+CLOUD_POLAR_FADE = 0.25  # 緯度 60° 以上の雲の残す割合 (海氷・氷床を雲と誤認するため)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA = os.path.join(ROOT, "data")
 
@@ -64,9 +76,20 @@ def load_rgb(path):
 
 
 def write_day(rgb):
+    # 森林などの暗い陸地は、同じ光でも砂漠よりずっと暗く見える。
+    # 陸地の暗い色を持ち上げ (ガンマ補正)、明るすぎる砂漠は抑える。海は深みを残すため弱く。
+    def land_curve(x):
+        y = (x / 255) ** LAND_GAMMA
+        if y > LAND_KNEE:                      # 明るい所 (砂漠など) は圧縮
+            y = LAND_KNEE + (y - LAND_KNEE) * LAND_HIGHLIGHT
+        return int(255 * y + 0.5)
+    lut_land = [land_curve(x) for x in range(256)]
+    lut_sea = [int(255 * (x / 255) ** SEA_GAMMA + 0.5) for x in range(256)]
     buf = bytearray(W * H * 2)
     for i in range(W * H):
         r, g, b = rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]
+        t = lut_sea if (b > r + 12 and b >= g) else lut_land
+        r, g, b = t[r], t[g], t[b]
         v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
         struct.pack_into("<H", buf, i * 2, v)
     with open(os.path.join(DATA, "earth_day.rgb565"), "wb") as f:
@@ -80,6 +103,28 @@ def write_night(rgb):
         buf[i] = (r * 77 + g * 150 + b * 29) >> 8
     with open(os.path.join(DATA, "earth_night.gray8"), "wb") as f:
         f.write(buf)
+
+
+def write_clouds(day_rgb, comp_rgb):
+    """雲入り画像と雲なし画像の「白さ」の差を雲の濃さとする"""
+    buf = bytearray(W * H)
+    for i in range(W * H):
+        o = i * 3
+        wc = min(comp_rgb[o], comp_rgb[o + 1], comp_rgb[o + 2])
+        ws = min(day_rgb[o], day_rgb[o + 1], day_rgb[o + 2])
+        a = (wc - ws) / max(16, 255 - ws)
+        a = min(1.0, max(0.0, (a - CLOUD_THRESHOLD) / (1.0 - CLOUD_THRESHOLD)))
+        lat = abs(0.5 - (i // W + 0.5) / H) * 180.0
+        t = min(1.0, max(0.0, (lat - 58.0) / 12.0))
+        polar = 1.0 - (1.0 - CLOUD_POLAR_FADE) * t
+        buf[i] = int(a * a * (3 - 2 * a) * CLOUD_OPACITY * polar * 255)
+    with open(os.path.join(DATA, "earth_cloud.gray8"), "wb") as f:
+        f.write(buf)
+
+
+def write_zero_clouds():
+    with open(os.path.join(DATA, "earth_cloud.gray8"), "wb") as f:
+        f.write(bytes(W * H))
 
 
 def placeholder():
@@ -123,6 +168,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--day")
     ap.add_argument("--night")
+    ap.add_argument("--clouds", help="雲入りの合成画像 (Land_ocean_ice_cloud)")
     ap.add_argument("--placeholder", action="store_true")
     a = ap.parse_args()
     os.makedirs(DATA, exist_ok=True)
@@ -130,10 +176,16 @@ def main():
         d, n = placeholder()
         write_day(d)
         write_night(n)
+        write_zero_clouds()
     else:
         if not a.day:
             ap.error("--day か --placeholder を指定してください")
-        write_day(load_rgb(a.day))
+        day = load_rgb(a.day)
+        write_day(day)
+        if a.clouds:
+            write_clouds(day, load_rgb(a.clouds))
+        elif not os.path.exists(os.path.join(DATA, "earth_cloud.gray8")):
+            write_zero_clouds()
         if a.night:
             write_night(load_rgb(a.night))
         else:
