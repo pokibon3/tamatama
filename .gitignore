@@ -10,9 +10,6 @@
 .pio/
 .vscode/
 
-# 元画像 (57MB と大きいので管理しない。earth/README.md の手順で再取得できる)
-earth/assets/
-
 # SolidCraft のバックアップ / ロックファイル (履歴は git で管理する)
 *.sc.bak
 .~*.lock
