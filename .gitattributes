@@ -1,0 +1,5 @@
+*.rgb565 binary
+*.gray8  binary
+*.stl    binary
+*.3mf    binary
+*.sc     binary
